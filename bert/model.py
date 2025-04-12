@@ -28,7 +28,7 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
         # x: (batch_size, seq_len, embed_dim)
-        # mask: (batch_size, 1, 1, seq_len) or (batch_size, seq_len, seq_len)
+        # mask: (batch_size * num_heads, seq_len, seq_len)
         attn_output, _ = self.attention(x, x, x, attn_mask=mask)
         x = x + attn_output
         x = self.norm1(x)
@@ -98,7 +98,7 @@ def test_transformer_encoder():
         embed_dim=embed_dim, num_heads=num_heads, dropout=dropout
     )
     input_tensor = torch.randn(10, 20, embed_dim)
-    mask = None
+    mask = torch.randint(low=0, high=1, size=(10*num_heads, 20, 20)).to(torch.bool)
 
     try:
         output_tensor = encoder(x=input_tensor, mask=mask)
@@ -139,6 +139,6 @@ def test_bert():
 
 
 if __name__ == "__main__":
-    # test_transformer_encoder()
-    # test_input_embedding()
+    test_transformer_encoder()
+    test_input_embedding()
     test_bert()
