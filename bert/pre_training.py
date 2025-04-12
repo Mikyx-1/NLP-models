@@ -10,13 +10,12 @@ Pre-training of BERT includes 2 tasks: MaskedLM and Next Sentence Prediction (NS
     - This helps the model understand relationships between sentences and improves performance on tasks like question answering and natural language inference.
 """
 
-import torch
-from model import BERT
-from transformers import AutoTokenizer
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-from datasets import load_dataset
 import random
+
+import torch
+from datasets import load_dataset
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer
 
 
 class PreTrainingDataset(Dataset):
