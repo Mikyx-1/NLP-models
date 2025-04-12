@@ -1,107 +1,96 @@
-"""
-Pre-training of BERT includes 2 tasks: MaskedLM and Next Sentence Prediction (NSP).
-
-1. Masked Language Model (MLM):
-    - Randomly masks some tokens in the input sequence and predicts the masked tokens.
-    - The model learns to predict the masked tokens based on their context.
-
-2. Next Sentence Prediction (NSP):
-    - Given two sentences, the model predicts whether the second sentence is the next sentence in the original text.
-    - This helps the model understand relationships between sentences and improves performance on tasks like question answering and natural language inference.
-"""
-
-import random
-
 import torch
-from datasets import load_dataset
-from torch.utils.data import Dataset
-from transformers import AutoTokenizer
+import torch.nn as nn
+from dataset import PreTrainingDataset
+from model import BERT
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 
-class PreTrainingDataset(Dataset):
-    def __init__(
-        self,
-        name: str = "stas/openwebtext-10k",
-        split: str = "train",
-        max_length: int = 512,
-        mask_prob: float = 0.15,
-        tokenizer_name: str = "bert-base-uncased",
-    ):
-        self.dataset = load_dataset(name, split=split)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        self.max_length = max_length
-        self.mask_prob = mask_prob
-
-        # Preprocess texts into sentences
-        self.sentences = []
-        for item in self.dataset:
-            text = item["text"]
-            if text:
-                sents = text.strip().split(". ")
-                self.sentences.extend(
-                    [s.strip() for s in sents if len(s.strip().split()) > 3]
-                )
-
-    def __len__(self):
-        return len(self.sentences) - 1
-
-    def __getitem__(self, index: int):
-        is_next = random.random() < 0.5
-
-        if is_next and index < len(self.sentences) - 1:
-            # Positive sample (sentence B follows A)
-            sent_a = self.sentences[index]
-            sent_b = self.sentences[index + 1]
-            label = 1
-        else:
-            # Negative sample (random sentence B)
-            sent_a = self.sentences[index]
-            sent_b = self.sentences[random.randint(0, len(self.sentences) - 1)]
-            label = 0
-
-        encoding = self.tokenizer(
-            sent_a,
-            sent_b,
-            truncation=True,
-            padding="max_length",
-            max_length=self.max_length,
-            return_tensors="pt",
+class BERTPreTrainingHead(nn.Module):
+    def __init__(self, hidden_size: int, vocab_size: int):
+        super().__init__()
+        self.mlm_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, vocab_size),
         )
+        self.nsp_head = nn.Linear(hidden_size, 2)
 
-        # Apply random masking for MLM task
-        input_ids = encoding["input_ids"].squeeze(0)
-        labels = input_ids.clone()
-        rand = torch.rand(input_ids.shape)
-        mask_arr = (
-            (rand < self.mask_prob)
-            & (input_ids != self.tokenizer.cls_token_id)
-            & (input_ids != self.tokenizer.sep_token_id)
-            & (input_ids != self.tokenizer.pad_token_id)
+    def forward(self, encoded: torch.Tensor):
+        # encoded shape: (batch_size, seq_len, hidden_size)
+        mlm_logits = self.mlm_head(encoded)
+        cls_rep = encoded[:, 0, :]  # Use CLS token for NSP
+        nsp_logits = self.nsp_head(cls_rep)
+        return mlm_logits, nsp_logits
+
+
+class BERTForPreTraining(nn.Module):
+    def __init__(self, vocab_size, max_seq_len, option="base"):
+        super().__init__()
+        self.bert = BERT(vocab_size, max_seq_len, option)
+        hidden_size = 768 if option == "base" else 1024
+        self.heads = BERTPreTrainingHead(hidden_size, vocab_size)
+
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        encoded = self.bert(input_ids)
+        mlm_logits, nsp_logits = self.heads(encoded)
+        return mlm_logits, nsp_logits
+
+
+def pretrain():
+    vocab_size = 30522  # Standard for BERT-base
+    max_len = 256
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    model = BERTForPreTraining(vocab_size, max_len, option="base").to(device)
+    dataset = PreTrainingDataset(max_length=max_len)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True, pin_memory=True)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    mlm_loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    nsp_loss_fn = nn.CrossEntropyLoss()
+
+    model.train()
+
+    for epoch in range(3):
+        total_loss = 0.0
+        total_loss_mlm = 0.0
+        total_loss_nsp = 0.0
+        num_batches = 0
+
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}"):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+            labels = batch["labels"].to(device)
+            nsp_labels = batch["next_sentence_label"].to(device)
+
+            optimizer.zero_grad()
+
+            mlm_logits, nsp_logits = model(input_ids, attention_mask, token_type_ids)
+
+            loss_mlm = mlm_loss_fn(
+                mlm_logits.view(-1, mlm_logits.size(-1)), labels.view(-1)
+            )
+            loss_nsp = nsp_loss_fn(nsp_logits, nsp_labels)
+
+            loss = loss_mlm + loss_nsp
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_loss_mlm += loss_mlm.item()
+            total_loss_nsp += loss_nsp.item()
+            num_batches += 1
+
+        avg_loss = total_loss / num_batches
+        avg_loss_mlm = total_loss_mlm / num_batches
+        avg_loss_nsp = total_loss_nsp / num_batches
+
+        print(
+            f"[Epoch {epoch+1}] Avg Loss: {avg_loss:.4f} | Avg MLM: {avg_loss_mlm:.4f} | Avg NSP: {avg_loss_nsp:.4f}"
         )
-
-        # 80% [MASK], 10% random, 10% unchanged
-        mask_indices = torch.where(mask_arr)[0]
-        for idx in mask_indices:
-            prob = random.random()
-            if prob < 0.8:
-                input_ids[idx] = self.tokenizer.mask_token_id
-            elif prob < 0.9:
-                input_ids[idx] = random.randint(0, self.tokenizer.vocab_size - 1)
-            # else: leave the token unchanged
-
-        return {
-            "input_ids": input_ids,
-            "token_type_ids": encoding["token_type_ids"].squeeze(0),
-            "attention_mask": encoding["attention_mask"].squeeze(0),
-            "labels": labels,
-            "next_sentence_label": torch.tensor(label, dtype=torch.long),
-        }
 
 
 if __name__ == "__main__":
-    dataset = PreTrainingDataset()
-    sample = dataset[0]
-
-    print("Input IDs:", sample["input_ids"])
-    print("Masked Labels:", sample["labels"])
-    print("NSP Label:", sample["next_sentence_label"])
+    pretrain()
